@@ -1,13 +1,8 @@
 # Infrastructure Showcase
 
-Terraform-managed infrastructure showcase for a solo-consultancy website. Manages Cloudflare (DNS, Workers, R2), GitHub, and Checkly resources with remote state stored in Cloudflare R2.
+Terraform-managed infrastructure for a solo-consultancy website. Manages Cloudflare (DNS, Workers, R2), GitHub, and Checkly resources with remote state stored in Cloudflare R2.
 
-Domain names, organization, and repository identifiers in this repo have been replaced with [RFC 2606](https://datatracker.ietf.org/doc/html/rfc2606) reserved examples (`example.com`, `example.dev`, `example.net`, `example-org`). The architecture and code are authentic; `terraform apply` will not run cleanly without substituting your own identifiers.
-
-## Prerequisites
-
-- [Terraform](https://www.terraform.io/) >= 1.10
-- [direnv](https://direnv.net/) (optional, for loading environment variables)
+This repository is a sanitized snapshot published as a portfolio reference. Domain names, organization, and repository identifiers have been replaced with [RFC 2606](https://datatracker.ietf.org/doc/html/rfc2606) reserved examples (`example.com`, `example.dev`, `example.net`, `example-org`). The architecture and code are authentic.
 
 ## Providers
 
@@ -16,36 +11,6 @@ Domain names, organization, and repository identifiers in this repo have been re
 | [cloudflare/cloudflare](https://registry.terraform.io/providers/cloudflare/cloudflare/latest) | ~> 5.0 | DNS, Workers, R2, zone settings |
 | [integrations/github](https://registry.terraform.io/providers/integrations/github/latest) | ~> 6.0 | Repos, secrets, branch protection |
 | [checkly/checkly](https://registry.terraform.io/providers/checkly/checkly/latest) | ~> 1.21 | Synthetic uptime monitoring, alerts |
-
-## Environment Variables
-
-Set these before running Terraform:
-
-```sh
-# Provider authentication
-CLOUDFLARE_API_TOKEN    # Scoped API token (zone + workers + R2 permissions)
-GITHUB_TOKEN            # Fine-grained PAT with Administration, Environments permissions
-CHECKLY_API_KEY         # User-scoped API key (User Settings > API Keys)
-CHECKLY_ACCOUNT_ID      # Account ID (Account Settings > General)
-
-# Remote state backend (Cloudflare R2, S3-compatible)
-AWS_ACCESS_KEY_ID       # R2 access key
-AWS_SECRET_ACCESS_KEY   # R2 secret key
-```
-
-All infrastructure-specific values (account IDs, zone IDs, verification tokens, DKIM keys) are supplied via Terraform variables. See [`terraform.tfvars.example`](terraform.tfvars.example) for the full list. In CI, these are injected as `TF_VAR_*` environment variables from GitHub secrets.
-
-## Usage
-
-```sh
-# Copy and fill in backend config and variable values
-cp backend.hcl.example backend.hcl
-cp terraform.tfvars.example terraform.tfvars
-
-terraform init -backend-config=backend.hcl
-terraform plan
-terraform apply
-```
 
 ## CI/CD
 
@@ -91,4 +56,3 @@ outputs.tf       # Output declarations
 - [`docs/terraform-best-practices.md`](docs/terraform-best-practices.md) — Comprehensive Terraform guide
 - [`docs/cloudflare-workers-playbook.md`](docs/cloudflare-workers-playbook.md) — Workers-specific patterns
 - [`docs/github-actions-best-practices.md`](docs/github-actions-best-practices.md) — GitHub Actions security and workflow patterns
-- [`docs/building-a-credible-website.md`](docs/building-a-credible-website.md) — Content strategy notes for solo-consultancy sites
