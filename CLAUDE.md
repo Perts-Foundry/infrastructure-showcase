@@ -80,4 +80,3 @@ When importing existing DNS:
 - `docs/terraform-best-practices.md` - Comprehensive Terraform guide
 - `docs/cloudflare-workers-playbook.md` - Workers-specific patterns
 - `docs/github-actions-best-practices.md` - GitHub Actions security and workflow patterns
-- `docs/building-a-credible-website.md` - Content strategy for solo-consultancy sites
