@@ -1,0 +1,554 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  # ── Parse the PR comment and determine whether this is a targeted operation ──
+  parse:
+    if: >-
+      github.event.issue.pull_request
+      && startsWith(github.event.comment.body, 'apply')
+      && (github.event.comment.author_association == 'OWNER'
+        || github.event.comment.author_association == 'MEMBER'
+        || github.event.comment.author_association == 'COLLABORATOR')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      is_targeted: ${{ steps.parse.outputs.is_targeted }}
+      targets: ${{ steps.parse.outputs.targets }}
+      target_list: ${{ steps.parse.outputs.target_list }}
+      ref: ${{ steps.pr.outputs.ref }}
+      sha: ${{ steps.pr.outputs.sha }}
+
+    steps:
+      - name: React to comment
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Get PR ref
+        id: pr
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('ref', pr.data.head.ref);
+            core.setOutput('sha', pr.data.head.sha);
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Parse comment
+        id: parse
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const parseTargets = require('./.github/scripts/parse-targets.js');
+            await parseTargets({github, context, core, heading: 'Apply'});
+
+  # ── Targeted path: fresh plan + apply when comment has -target flags ──
+  apply-targeted:
+    needs: parse
+    if: needs.parse.outputs.is_targeted == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: terraform
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ needs.parse.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3.1.2
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$R2_STATE_BUCKET" \
+            -backend-config="endpoints={s3=\"$R2_ENDPOINT\"}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_STATE_BUCKET: ${{ secrets.R2_STATE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
+      - name: Targeted Plan
+        id: targeted-plan
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          CHECKLY_API_KEY: ${{ secrets.CHECKLY_API_KEY }}
+          CHECKLY_ACCOUNT_ID: ${{ secrets.CHECKLY_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_zone_id_com: ${{ secrets.ZONE_ID_COM }}
+          TF_VAR_zone_id_dev: ${{ secrets.ZONE_ID_DEV }}
+          TF_VAR_zone_id_net: ${{ secrets.ZONE_ID_NET }}
+          TF_VAR_access_allowed_email: ${{ secrets.ACCESS_ALLOWED_EMAIL }}
+          TF_VAR_protonmail_dkim_cname_target: ${{ secrets.PROTONMAIL_DKIM_CNAME_TARGET }}
+          TF_VAR_protonmail_verification_token: ${{ secrets.PROTONMAIL_VERIFICATION_TOKEN }}
+          TF_VAR_google_site_verification: ${{ secrets.GOOGLE_SITE_VERIFICATION }}
+          TF_VAR_github_org_verification: ${{ secrets.GITHUB_ORG_VERIFICATION }}
+          TF_VAR_resend_dkim_public_key: ${{ secrets.RESEND_DKIM_PUBLIC_KEY }}
+          TF_VAR_dmarc_rua_email: ${{ secrets.DMARC_RUA_EMAIL }}
+          TF_VAR_checkly_alert_email: ${{ secrets.CHECKLY_ALERT_EMAIL }}
+          TARGET_FLAGS: ${{ needs.parse.outputs.targets }}
+        run: |
+          set -o pipefail
+          # $TARGET_FLAGS is intentionally unquoted to allow word-splitting
+          # into separate -target arguments. The value is pre-validated by
+          # .github/scripts/parse-targets.js to contain only safe characters.
+          # Globbing is disabled because targets may contain brackets.
+          set -f
+          terraform plan -no-color $TARGET_FLAGS -out=tfplan 2>&1 | tee /tmp/plan.out
+
+      - name: Targeted Apply
+        id: targeted-apply
+        if: steps.targeted-plan.outcome == 'success'
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          CHECKLY_API_KEY: ${{ secrets.CHECKLY_API_KEY }}
+          CHECKLY_ACCOUNT_ID: ${{ secrets.CHECKLY_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_zone_id_com: ${{ secrets.ZONE_ID_COM }}
+          TF_VAR_zone_id_dev: ${{ secrets.ZONE_ID_DEV }}
+          TF_VAR_zone_id_net: ${{ secrets.ZONE_ID_NET }}
+          TF_VAR_access_allowed_email: ${{ secrets.ACCESS_ALLOWED_EMAIL }}
+          TF_VAR_protonmail_dkim_cname_target: ${{ secrets.PROTONMAIL_DKIM_CNAME_TARGET }}
+          TF_VAR_protonmail_verification_token: ${{ secrets.PROTONMAIL_VERIFICATION_TOKEN }}
+          TF_VAR_google_site_verification: ${{ secrets.GOOGLE_SITE_VERIFICATION }}
+          TF_VAR_github_org_verification: ${{ secrets.GITHUB_ORG_VERIFICATION }}
+          TF_VAR_resend_dkim_public_key: ${{ secrets.RESEND_DKIM_PUBLIC_KEY }}
+          TF_VAR_dmarc_rua_email: ${{ secrets.DMARC_RUA_EMAIL }}
+          TF_VAR_checkly_alert_email: ${{ secrets.CHECKLY_ALERT_EMAIL }}
+        run: |
+          set -o pipefail
+          terraform apply -no-color -auto-approve tfplan 2>&1 | tee /tmp/apply.out
+
+      - name: Post Targeted Success
+        if: steps.targeted-apply.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          TARGET_LIST: ${{ needs.parse.outputs.target_list }}
+          HEAD_SHA: ${{ needs.parse.outputs.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/apply.out', 'utf8');
+            const targetList = process.env.TARGET_LIST;
+            const sha = process.env.HEAD_SHA;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = '## Terraform Apply\n\n'
+              + ':dart: **Targeted Apply:** ' + targetList + '\n\n'
+              + ':white_check_mark: Apply succeeded\n\n'
+              + '<details><summary>Show Output</summary>\n\n```\n'
+              + output + '\n```\n</details>\n\n'
+              + 'Applied at commit `' + sha + '`.\n\n'
+              + 'This was a targeted apply, so the PR was not merged. '
+              + 'To reconcile remaining changes:\n'
+              + '1. Comment `plan` to generate a full plan\n'
+              + '2. Review the plan output\n'
+              + '3. Comment `apply` to apply all remaining changes and merge\n\n'
+              + 'For targeted operations, `plan -target=X` followed by `apply` '
+              + 'is the safer workflow because it lets you review the plan '
+              + 'before applying.\n\n'
+              + '---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Post Targeted Failure
+        if: >-
+          steps.targeted-plan.outcome == 'failure'
+          || steps.targeted-apply.outcome == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          TARGET_LIST: ${{ needs.parse.outputs.target_list }}
+          PLAN_OUTCOME: ${{ steps.targeted-plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const targetList = process.env.TARGET_LIST;
+            const planFailed = process.env.PLAN_OUTCOME === 'failure';
+            let output = '';
+            const file = planFailed ? '/tmp/plan.out' : '/tmp/apply.out';
+            try {
+              output = fs.readFileSync(file, 'utf8');
+            } catch {
+              output = (planFailed ? 'Plan' : 'Apply')
+                + ' did not produce output. Check the Actions log.';
+            }
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = '## Terraform Apply\n\n'
+              + ':dart: **Targeted Apply:** ' + targetList + '\n\n'
+              + ':x: ' + (planFailed ? 'Plan' : 'Apply') + ' failed\n\n```\n'
+              + output + '\n```\n\n'
+              + 'Fix the errors above, commit the changes, and push to re-run.\n\n'
+              + '---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Check Status
+        if: >-
+          steps.targeted-plan.outcome == 'failure'
+          || steps.targeted-apply.outcome == 'failure'
+        run: exit 1
+
+  # ── Artifact path: apply a saved plan from the plan workflow ──
+  apply-full:
+    needs: parse
+    if: needs.parse.outputs.is_targeted != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: terraform
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ needs.parse.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3.1.2
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$R2_STATE_BUCKET" \
+            -backend-config="endpoints={s3=\"$R2_ENDPOINT\"}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_STATE_BUCKET: ${{ secrets.R2_STATE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
+      - name: Find plan artifact
+        id: find-plan
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const artifactName = `tfplan-${context.issue.number}`;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'terraform-plan.yml',
+              status: 'completed',
+              per_page: 20
+            });
+            for (const run of runs.data.workflow_runs) {
+              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id
+              });
+              const plan = artifacts.data.artifacts.find(a => a.name === artifactName && !a.expired);
+              if (plan) {
+                core.setOutput('run_id', run.id);
+                return;
+              }
+            }
+            core.setFailed('No plan artifact found');
+
+      - name: No Plan Found
+        if: steps.find-plan.outcome == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = '## Terraform Apply\n\n'
+              + ':x: No plan found. The plan artifact may have expired or the plan job did not succeed.\n\n'
+              + 'Comment `plan` to generate a fresh plan, then comment `apply` again.\n\n'
+              + '---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Download Plan
+        if: steps.find-plan.outcome == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: tfplan-${{ github.event.issue.number }}
+          run-id: ${{ steps.find-plan.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check plan targets
+        id: check-targets
+        if: steps.find-plan.outcome == 'success'
+        run: |
+          TARGETS=""
+          if [ -f plan-targets.txt ]; then
+            TARGETS=$(cat plan-targets.txt | tr -d '[:space:]')
+          fi
+          if [ -n "$TARGETS" ]; then
+            echo "is_targeted=true" >> "$GITHUB_OUTPUT"
+            echo "target_list=$(cat plan-targets.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_targeted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify plan matches PR head
+        id: verify
+        if: steps.find-plan.outcome == 'success'
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ needs.parse.outputs.sha }}
+        run: |
+          PLAN_SHA=$(cat plan-sha.txt)
+          if [ "$PLAN_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::Plan was generated for $PLAN_SHA but PR head is now $HEAD_SHA"
+            exit 1
+          fi
+
+      - name: Post SHA Mismatch
+        if: steps.verify.outcome == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = '## Terraform Apply\n\n'
+              + ':x: The plan is out of date. New commits have been pushed since the plan was generated.\n\n'
+              + 'Comment `plan` to generate a fresh plan, then comment `apply` again.\n\n'
+              + '---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Terraform Apply
+        id: apply
+        if: steps.verify.outcome == 'success'
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          CHECKLY_API_KEY: ${{ secrets.CHECKLY_API_KEY }}
+          CHECKLY_ACCOUNT_ID: ${{ secrets.CHECKLY_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_zone_id_com: ${{ secrets.ZONE_ID_COM }}
+          TF_VAR_zone_id_dev: ${{ secrets.ZONE_ID_DEV }}
+          TF_VAR_zone_id_net: ${{ secrets.ZONE_ID_NET }}
+          TF_VAR_access_allowed_email: ${{ secrets.ACCESS_ALLOWED_EMAIL }}
+          TF_VAR_protonmail_dkim_cname_target: ${{ secrets.PROTONMAIL_DKIM_CNAME_TARGET }}
+          TF_VAR_protonmail_verification_token: ${{ secrets.PROTONMAIL_VERIFICATION_TOKEN }}
+          TF_VAR_google_site_verification: ${{ secrets.GOOGLE_SITE_VERIFICATION }}
+          TF_VAR_github_org_verification: ${{ secrets.GITHUB_ORG_VERIFICATION }}
+          TF_VAR_resend_dkim_public_key: ${{ secrets.RESEND_DKIM_PUBLIC_KEY }}
+          TF_VAR_dmarc_rua_email: ${{ secrets.DMARC_RUA_EMAIL }}
+          TF_VAR_checkly_alert_email: ${{ secrets.CHECKLY_ALERT_EMAIL }}
+        run: |
+          set -o pipefail
+          terraform apply -no-color -auto-approve tfplan 2>&1 | tee /tmp/apply.out
+
+      - name: Post Apply Output to PR
+        if: steps.apply.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          IS_TARGETED: ${{ steps.check-targets.outputs.is_targeted }}
+          TARGET_LIST: ${{ steps.check-targets.outputs.target_list }}
+          HEAD_SHA: ${{ needs.parse.outputs.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/apply.out', 'utf8');
+            const isTargeted = process.env.IS_TARGETED === 'true';
+            const targetList = process.env.TARGET_LIST || '';
+            const sha = process.env.HEAD_SHA;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            let body = '## Terraform Apply\n\n';
+            if (isTargeted) {
+              body += ':dart: **Targeted Apply:** ' + targetList + '\n\n';
+            }
+            body += ':white_check_mark: Apply succeeded\n\n'
+              + '<details><summary>Show Output</summary>\n\n```\n'
+              + output + '\n```\n</details>\n\n'
+              + 'Applied at commit `' + sha + '`.';
+            if (isTargeted) {
+              body += '\n\nThis was a targeted apply, so the PR was not merged. '
+                + 'To reconcile remaining changes:\n'
+                + '1. Comment `plan` to generate a full plan\n'
+                + '2. Review the plan output\n'
+                + '3. Comment `apply` to apply all remaining changes and merge';
+            }
+            body += '\n\n---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Fetch base branch for merge
+        if: >-
+          steps.apply.outcome == 'success'
+          && steps.check-targets.outputs.is_targeted != 'true'
+        run: git fetch origin main --depth=1
+
+      - name: Merge PR
+        if: >-
+          steps.apply.outcome == 'success'
+          && steps.check-targets.outputs.is_targeted != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: gh pr merge "$PR_NUMBER" --squash --admin --delete-branch
+
+      - name: Post Failure to PR
+        if: steps.apply.outcome == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const fs = require('fs');
+            let output = '';
+            try {
+              output = fs.readFileSync('/tmp/apply.out', 'utf8');
+            } catch {
+              output = 'Apply did not produce output. Check the Actions log.';
+            }
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = '## Terraform Apply\n\n'
+              + ':x: Apply failed\n\n```\n'
+              + output + '\n```\n\n'
+              + 'Fix the errors above, commit the changes, and push to re-run.\n\n'
+              + '---\n*[View workflow run](' + runUrl + ')*';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Check Status
+        if: >-
+          steps.find-plan.outcome == 'failure'
+          || steps.verify.outcome == 'failure'
+          || steps.apply.outcome == 'failure'
+        run: exit 1
+
+  # Safety net: when a PR is merged without a prior "apply" comment, catch
+  # any pending drift by running a fresh plan + apply against main.
+  apply-on-push:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: terraform
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3.1.2
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$R2_STATE_BUCKET" \
+            -backend-config="endpoints={s3=\"$R2_ENDPOINT\"}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_STATE_BUCKET: ${{ secrets.R2_STATE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
+      - name: Terraform Plan
+        id: plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          CHECKLY_API_KEY: ${{ secrets.CHECKLY_API_KEY }}
+          CHECKLY_ACCOUNT_ID: ${{ secrets.CHECKLY_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_zone_id_com: ${{ secrets.ZONE_ID_COM }}
+          TF_VAR_zone_id_dev: ${{ secrets.ZONE_ID_DEV }}
+          TF_VAR_zone_id_net: ${{ secrets.ZONE_ID_NET }}
+          TF_VAR_access_allowed_email: ${{ secrets.ACCESS_ALLOWED_EMAIL }}
+          TF_VAR_protonmail_dkim_cname_target: ${{ secrets.PROTONMAIL_DKIM_CNAME_TARGET }}
+          TF_VAR_protonmail_verification_token: ${{ secrets.PROTONMAIL_VERIFICATION_TOKEN }}
+          TF_VAR_google_site_verification: ${{ secrets.GOOGLE_SITE_VERIFICATION }}
+          TF_VAR_github_org_verification: ${{ secrets.GITHUB_ORG_VERIFICATION }}
+          TF_VAR_resend_dkim_public_key: ${{ secrets.RESEND_DKIM_PUBLIC_KEY }}
+          TF_VAR_dmarc_rua_email: ${{ secrets.DMARC_RUA_EMAIL }}
+          TF_VAR_checkly_alert_email: ${{ secrets.CHECKLY_ALERT_EMAIL }}
+        run: |
+          exitcode=0
+          terraform plan -no-color -detailed-exitcode -out=tfplan || exitcode=$?
+          echo "exitcode=$exitcode" >> "$GITHUB_OUTPUT"
+          if [ "$exitcode" -eq 1 ]; then exit 1; fi
+
+      - name: Terraform Apply
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_ADMIN }}
+          CHECKLY_API_KEY: ${{ secrets.CHECKLY_API_KEY }}
+          CHECKLY_ACCOUNT_ID: ${{ secrets.CHECKLY_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_zone_id_com: ${{ secrets.ZONE_ID_COM }}
+          TF_VAR_zone_id_dev: ${{ secrets.ZONE_ID_DEV }}
+          TF_VAR_zone_id_net: ${{ secrets.ZONE_ID_NET }}
+          TF_VAR_access_allowed_email: ${{ secrets.ACCESS_ALLOWED_EMAIL }}
+          TF_VAR_protonmail_dkim_cname_target: ${{ secrets.PROTONMAIL_DKIM_CNAME_TARGET }}
+          TF_VAR_protonmail_verification_token: ${{ secrets.PROTONMAIL_VERIFICATION_TOKEN }}
+          TF_VAR_google_site_verification: ${{ secrets.GOOGLE_SITE_VERIFICATION }}
+          TF_VAR_github_org_verification: ${{ secrets.GITHUB_ORG_VERIFICATION }}
+          TF_VAR_resend_dkim_public_key: ${{ secrets.RESEND_DKIM_PUBLIC_KEY }}
+          TF_VAR_dmarc_rua_email: ${{ secrets.DMARC_RUA_EMAIL }}
+          TF_VAR_checkly_alert_email: ${{ secrets.CHECKLY_ALERT_EMAIL }}
+        run: terraform apply -no-color -auto-approve tfplan

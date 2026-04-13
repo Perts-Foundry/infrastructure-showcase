@@ -1,0 +1,7 @@
+# Copy to backend.hcl and fill in values, then init with:
+#   terraform init -backend-config=backend.hcl
+
+bucket = "your-state-bucket-name"
+endpoints = {
+  s3 = "https://your-account-id.r2.cloudflarestorage.com"
+}
